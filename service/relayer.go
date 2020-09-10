@@ -19,7 +19,14 @@ package service
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	sdk "github.com/cosmos/cosmos-sdk/types"
 	types2 "github.com/cosmos/cosmos-sdk/types"
 	"github.com/cosmos/cosmos-sdk/x/auth"
 	"github.com/cosmos/cosmos-sdk/x/auth/types"
@@ -28,12 +35,27 @@ import (
 	"github.com/polynetwork/cosmos-relayer/context"
 	"github.com/polynetwork/cosmos-relayer/log"
 	mcli "github.com/polynetwork/poly-go-sdk/client"
+	polycommon "github.com/polynetwork/poly/common"
 	mtypes "github.com/polynetwork/poly/core/types"
+	"github.com/polynetwork/poly/merkle"
+	ccmc "github.com/polynetwork/poly/native/service/cross_chain_manager/common"
 	mcosmos "github.com/polynetwork/poly/native/service/header_sync/cosmos"
 	core_types "github.com/tendermint/tendermint/rpc/core/types"
-	"strings"
-	"time"
 )
+
+// GetMinFeesResponse get min fees response
+type GetMinFeesResponse struct {
+	PrevUpdateTime int64                             `json:"prev_update_time"`
+	Details        map[string]GetMinFeesResponseItem `json:"details"`
+}
+
+// GetMinFeesResponseItem get min fees response item
+type GetMinFeesResponseItem struct {
+	Fee        sdk.Int `json:"fee"`
+	MinFee     sdk.Int `json:"min_fee"`
+	PrevMinFee sdk.Int `json:"prev_min_fee"`
+	CurrMinFee sdk.Int `json:"curr_min_fee"`
+}
 
 func StartRelay() {
 	go ToPolyRoutine()
@@ -245,6 +267,96 @@ func handlePolyHdr(hdr *mtypes.Header) {
 		hdr.Height, seq)
 }
 
+func getFees(denom string) (*GetMinFeesResponse, error) {
+	if ctx.Conf.FeeURL == "" {
+		return nil, errors.New("fee url is empty")
+	}
+
+	url := ctx.Conf.FeeURL + "/min_fees?denom=" + denom
+	res, err := http.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != http.StatusOK {
+		return nil, errors.New("could not fetch fee")
+	}
+
+	var feesRes GetMinFeesResponse
+	err = json.NewDecoder(res.Body).Decode(&feesRes)
+	// return nil as the result because the response was ok
+	// but the asset is not supported
+	if err != nil {
+		return nil, nil
+	}
+
+	return &feesRes, nil
+}
+
+func shouldSendCosmosTx(val *context.PolyInfo) (bool, error) {
+	proof, err := hex.DecodeString(val.Tx.Proof)
+	if err != nil {
+		return false, err
+	}
+
+	value, err := merkle.MerkleProve(proof, val.Hdr.CrossStateRoot[:])
+	if err != nil {
+		return false, err
+	}
+
+	merkleValue := new(ccmc.ToMerkleValue)
+	if err := merkleValue.Deserialization(polycommon.NewZeroCopySource(value)); err != nil {
+		return false, err
+	}
+
+	if merkleValue.MakeTxParam.Method == "unlock" {
+		// only perform the fee check for neo deposits
+		// if it is not from neo then just return nil
+		if merkleValue.FromChainID != ctx.Conf.NeoChainId {
+			return true, nil
+		}
+
+		// if there is no fee address then we assume no filtering
+		// is required so just return true
+		if ctx.Conf.FeeAddress == "" {
+			return true, nil
+		}
+
+		args := new(TxArgs)
+		if err := args.Deserialization(polycommon.NewZeroCopySource(merkleValue.MakeTxParam.Args), 32); err != nil {
+			return false, err
+		}
+
+		feeAddressAcc := sdk.AccAddress(args.FeeAddress)
+		if feeAddressAcc.String() != ctx.Conf.FeeAddress {
+			return false, nil
+		}
+
+		// for reliability, if we cannot fetch the fees
+		// then just broadcast the txn
+		denom := string(args.ToAssetHash)
+		fees, err := getFees(denom)
+		if err != nil {
+			return true, nil
+		}
+		// this asset is not supported, so we just return false
+		if fees == nil {
+			return false, nil
+		}
+
+		fee, ok := fees.Details["deposit"]
+		if !ok || fee.MinFee.IsZero() {
+			return false, nil
+		}
+
+		feeAmount := sdk.NewIntFromBigInt(args.FeeAmount)
+		return feeAmount.GTE(fee.MinFee), nil
+	}
+
+	return true, nil
+}
+
 // Relay the cross-chain tx to COSMOS.
 func handlePolyTx(val *context.PolyInfo) {
 	if val.Tx.IsEpoch && val.Hdr.Height > ctx.CMStatus.PolyEpochHeight && ctx.CMStatus.Len() > 0 {
@@ -253,6 +365,15 @@ func handlePolyTx(val *context.PolyInfo) {
 		ctx.CMStatus.Wg.Wait()
 		ctx.CMStatus.Wg.Add(1)
 	}
+
+	shouldSend, err := shouldSendCosmosTx(val)
+	if err != nil {
+		log.Warnf("[handlePolyTx] handlePolyTx error: %v", err)
+	}
+	if !shouldSend {
+		return
+	}
+
 	res, seq, err := sendCosmosTx([]types2.Msg{
 		ccm.NewMsgProcessCrossChainTx(ctx.CMAcc, ctx.Poly.ChainId, val.Tx.Proof,
 			hex.EncodeToString(val.Hdr.ToArray()), val.HeaderProof, val.EpochAnchor),

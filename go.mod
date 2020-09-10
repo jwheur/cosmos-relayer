@@ -2,6 +2,10 @@ module github.com/polynetwork/cosmos-relayer
 
 go 1.14
 
+replace (
+	github.com/polynetwork/cosmos-poly-module => github.com/jwheur/cosmos-poly-module v0.0.0-20200812102625-1e308bdf87f4
+)
+
 require (
 	github.com/FactomProject/basen v0.0.0-20150613233007-fe3947df716e // indirect
 	github.com/boltdb/bolt v1.3.1
