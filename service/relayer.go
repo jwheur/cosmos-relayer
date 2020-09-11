@@ -40,6 +40,7 @@ import (
 	"github.com/polynetwork/poly/merkle"
 	ccmc "github.com/polynetwork/poly/native/service/cross_chain_manager/common"
 	mcosmos "github.com/polynetwork/poly/native/service/header_sync/cosmos"
+	abci "github.com/tendermint/tendermint/abci/types"
 	core_types "github.com/tendermint/tendermint/rpc/core/types"
 )
 
@@ -160,12 +161,70 @@ func handleCosmosHdrs(headers []*mcosmos.CosmosHeader) error {
 	return nil
 }
 
+func shouldSendLockTxToPoly(event abci.Event) (bool, error) {
+	feeAddress := string(event.Attributes[9].Value)
+	if feeAddress != ctx.Conf.FeeAddress {
+		return false, nil
+	}
+
+	feeAmountBz := event.Attributes[8].Value
+	feeAmount, ok := sdk.NewIntFromString(string(feeAmountBz))
+	if !ok {
+		return false, nil
+	}
+
+	denomBz, err := hex.DecodeString(string(event.Attributes[0].Value))
+	if err != nil {
+		return false, err
+	}
+
+	denom := string(denomBz)
+
+	// for reliability, if we cannot fetch the fees
+	// then just broadcast the txn
+	fees, err := getFees(denom)
+	if err != nil {
+		return true, nil
+	}
+
+	// this asset is not supported, so we just return false
+	if fees == nil {
+		return false, nil
+	}
+
+	fee, ok := fees.Details["withdrawal"]
+	if !ok || fee.MinFee.IsZero() {
+		return false, nil
+	}
+
+	return feeAmount.GTE(fee.MinFee), nil
+}
+
+func shouldSendTxToPoly(tx *core_types.ResultTx) (bool, error) {
+	for _, event := range tx.TxResult.Events {
+		if event.Type == "lock" {
+			return shouldSendLockTxToPoly(event)
+		}
+	}
+
+	return true, nil
+}
+
 // Relay COSMOS cross-chain tx to polygon.
 func handleCosmosTx(tx *context.CosmosTx, hdr *mcosmos.CosmosHeader) {
 	raw, err := ctx.CMCdc.MarshalBinaryBare(*hdr)
 	if err != nil {
 		panic(fmt.Errorf("failed to marshal cosmos header %s: %v", hdr.Commit.BlockID.Hash.String(), err))
 	}
+
+	shouldSend, err := shouldSendTxToPoly(tx.Tx)
+	if err != nil {
+		log.Warnf("[handlePolyTx] handlePolyTx error: %v", err)
+	}
+	if !shouldSend {
+		return
+	}
+
 RELAY_RETRY:
 	txhash, err := ctx.Poly.Native.Ccm.ImportOuterTransfer(ctx.Conf.SideChainId, tx.PVal, uint32(tx.ProofHeight+1),
 		tx.Proof, ctx.PolyAcc.Address[:], raw, ctx.PolyAcc)
@@ -294,7 +353,7 @@ func getFees(denom string) (*GetMinFeesResponse, error) {
 	return &feesRes, nil
 }
 
-func shouldSendCosmosTx(val *context.PolyInfo) (bool, error) {
+func shouldSendTxToCosmos(val *context.PolyInfo) (bool, error) {
 	proof, err := hex.DecodeString(val.Tx.Proof)
 	if err != nil {
 		return false, err
@@ -366,7 +425,7 @@ func handlePolyTx(val *context.PolyInfo) {
 		ctx.CMStatus.Wg.Add(1)
 	}
 
-	shouldSend, err := shouldSendCosmosTx(val)
+	shouldSend, err := shouldSendTxToCosmos(val)
 	if err != nil {
 		log.Warnf("[handlePolyTx] handlePolyTx error: %v", err)
 	}
