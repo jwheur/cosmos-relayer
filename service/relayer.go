@@ -180,15 +180,8 @@ func shouldSendLockTxToPoly(event abci.Event) (bool, error) {
 
 	denom := string(denomBz)
 
-	// for reliability, if we cannot fetch the fees
-	// then just broadcast the txn
 	fees, err := getFees(denom)
 	if err != nil {
-		return true, nil
-	}
-
-	// this asset is not supported, so we just return false
-	if fees == nil {
 		return false, nil
 	}
 
@@ -339,15 +332,13 @@ func getFees(denom string) (*GetMinFeesResponse, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		return nil, errors.New("could not fetch fee")
+		return nil, errors.New("could not fetch fees")
 	}
 
 	var feesRes GetMinFeesResponse
 	err = json.NewDecoder(res.Body).Decode(&feesRes)
-	// return nil as the result because the response was ok
-	// but the asset is not supported
 	if err != nil {
-		return nil, nil
+		return nil, err
 	}
 
 	return &feesRes, nil
@@ -392,15 +383,10 @@ func shouldSendTxToCosmos(val *context.PolyInfo) (bool, error) {
 			return false, nil
 		}
 
-		// for reliability, if we cannot fetch the fees
-		// then just broadcast the txn
 		denom := string(args.ToAssetHash)
+
 		fees, err := getFees(denom)
 		if err != nil {
-			return true, nil
-		}
-		// this asset is not supported, so we just return false
-		if fees == nil {
 			return false, nil
 		}
 
